@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 from .database import Base, engine, get_db
 from .models import AirlockAudit, HoneyToken, ImageScanLog, TrapAlert
 from .schemas import (
+    AgentHookInstallResponse,
+    AgentHookStatusResponse,
     AirlockScanRequest,
     AirlockScanResponse,
     BoundingBox,
@@ -19,11 +21,20 @@ from .schemas import (
     HoneyTokenOut,
     InspectCommandRequest,
     InspectCommandResponse,
+    PlantDecoyRequest,
+    PlantDecoyResponse,
     RedactRequest,
     RedactResponse,
+    ResetDbResponse,
 )
+from .services.agent_integration import check_agent_hook_status, install_git_hook_and_rule
 from .services.airlock import scan_airlock_content
-from .services.honey_trap import deploy_default_honey_tokens, inspect_agent_command
+from .services.honey_trap import (
+    deploy_default_honey_tokens,
+    inspect_agent_command,
+    plant_file_decoy,
+    trigger_canary_trip,
+)
 from .services.pixel_shield import (
     base64_to_image,
     generate_sample_service,
@@ -33,19 +44,17 @@ from .services.pixel_shield import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure all SQLite tables are initialized on startup
     Base.metadata.create_all(bind=engine)
     yield
 
 
 app = FastAPI(
     title="ZeroSpill API",
-    description="Open-Source Pixel-DLP, Honey-Token Trap & Skill Airlock for Autonomous AI Coding Agents",
-    version="1.0.0",
+    description="Production-Grade Neural OCR Pixel-DLP, Honey-Token Trap & Skill Airlock for Autonomous AI Coding Agents",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,7 +66,7 @@ app.add_middleware(
 
 @app.get("/api/health", summary="Health check endpoint")
 def health_check():
-    return {"status": "ok", "service": "ZeroSpill", "version": "1.0.0"}
+    return {"status": "ok", "service": "ZeroSpill", "version": "2.0.0"}
 
 
 @app.get("/api/v1/dashboard/stats", response_model=DashboardStats, summary="System-wide telemetry stats")
@@ -67,13 +76,12 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     blocked_attempts = db.query(TrapAlert).filter(TrapAlert.blocked == True).count()
     airlock_audits_count = db.query(AirlockAudit).count()
 
-    # Aggregate recent 10 events
     recent_events = []
 
     recent_alerts = (
         db.query(TrapAlert)
         .order_by(TrapAlert.timestamp.desc())
-        .limit(5)
+        .limit(6)
         .all()
     )
     for alert in recent_alerts:
@@ -90,7 +98,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     recent_audits = (
         db.query(AirlockAudit)
         .order_by(AirlockAudit.timestamp.desc())
-        .limit(5)
+        .limit(6)
         .all()
     )
     for audit in recent_audits:
@@ -104,7 +112,6 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
             "timestamp": audit.timestamp.isoformat(),
         })
 
-    # Sort recent events by timestamp desc
     recent_events.sort(key=lambda x: x["timestamp"], reverse=True)
 
     return DashboardStats(
@@ -117,12 +124,12 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
 
 
 # Module A: PixelShield Endpoints
-@app.post("/api/v1/pixel/generate-sample", response_model=GenerateSampleResponse, summary="Generate simulated agent screenshot with secrets")
+@app.post("/api/v1/pixel/generate-sample", response_model=GenerateSampleResponse, summary="Generate simulated agent screenshot with real OCR secrets")
 def generate_sample_screenshot(db: Session = Depends(get_db)):
     return generate_sample_service(db)
 
 
-@app.post("/api/v1/pixel/redact", response_model=RedactResponse, summary="Redact sensitive bounding boxes in base64 image")
+@app.post("/api/v1/pixel/redact", response_model=RedactResponse, summary="Redact sensitive bounding boxes in base64 image via RapidOCR")
 def redact_image_json(payload: RedactRequest, db: Session = Depends(get_db)):
     if not payload.image_base64:
         raise HTTPException(status_code=400, detail="Missing image_base64 string in request.")
@@ -182,6 +189,16 @@ def get_active_honey_tokens(db: Session = Depends(get_db)):
     return [HoneyTokenOut.model_validate(t) for t in tokens]
 
 
+@app.post("/api/v1/honeytrap/plant-file", response_model=PlantDecoyResponse, summary="Plant real decoy file on disk with live Canary URL")
+def plant_decoy_file(req: PlantDecoyRequest, db: Session = Depends(get_db)):
+    return plant_file_decoy(db, req.target_path)
+
+
+@app.get("/api/v1/honeytrap/canary/{token_id}", response_model=InspectCommandResponse, summary="Live Canary URL endpoint: trips circuit breaker when accessed")
+def canary_endpoint(token_id: int, db: Session = Depends(get_db)):
+    return trigger_canary_trip(db, token_id)
+
+
 @app.post("/api/v1/honeytrap/inspect-command", response_model=InspectCommandResponse, summary="Inspect agent command for honey-tokens and destructive behaviors")
 def inspect_command(req: InspectCommandRequest, db: Session = Depends(get_db)):
     return inspect_agent_command(db, req.command, req.context)
@@ -202,3 +219,37 @@ def list_airlock_audits(db: Session = Depends(get_db)):
         .all()
     )
     return audits
+
+
+# Agent Hook & Integration Endpoints
+@app.post("/api/v1/agent-integration/install-hook", response_model=AgentHookInstallResponse, summary="Install Git pre-commit hook and agent guardrail rule")
+def install_hook():
+    res = install_git_hook_and_rule()
+    return AgentHookInstallResponse(**res)
+
+
+@app.get("/api/v1/agent-integration/status", response_model=AgentHookStatusResponse, summary="Check Git hook and rule installation status")
+def get_hook_status():
+    res = check_agent_hook_status()
+    return AgentHookStatusResponse(**res)
+
+
+# Admin & Clean Slate
+@app.post("/api/v1/admin/reset-db", response_model=ResetDbResponse, summary="Reset SQLite database to 100% clean slate")
+def reset_database(db: Session = Depends(get_db)):
+    deleted_images = db.query(ImageScanLog).delete()
+    deleted_alerts = db.query(TrapAlert).delete()
+    deleted_tokens = db.query(HoneyToken).delete()
+    deleted_audits = db.query(AirlockAudit).delete()
+    db.commit()
+
+    return ResetDbResponse(
+        status="DATABASE_RESET_CLEAN",
+        message="All logs, tokens, alerts, and airlock audits deleted. Database is in pristine state.",
+        rows_deleted={
+            "images": deleted_images,
+            "alerts": deleted_alerts,
+            "tokens": deleted_tokens,
+            "audits": deleted_audits,
+        },
+    )

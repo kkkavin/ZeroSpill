@@ -1,12 +1,19 @@
 from datetime import datetime, timezone
 import json
+import os
+from pathlib import Path
 import re
 import secrets
 from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from ..models import HoneyToken, TrapAlert
-from ..schemas import DeployHoneyTokensResponse, HoneyTokenOut, InspectCommandResponse
+from ..schemas import (
+    DeployHoneyTokensResponse,
+    HoneyTokenOut,
+    InspectCommandResponse,
+    PlantDecoyResponse,
+)
 
 
 DESTRUCTIVE_PATTERNS = [
@@ -23,7 +30,6 @@ DESTRUCTIVE_PATTERNS = [
 
 def deploy_default_honey_tokens(db: Session) -> DeployHoneyTokensResponse:
     """Generates synthetic decoy credentials across cloud, db, and payment platforms."""
-    # Check if active tokens already exist, or generate fresh decoys
     active_tokens = db.query(HoneyToken).filter(HoneyToken.status == "ACTIVE").all()
     if active_tokens and len(active_tokens) >= 4:
         return DeployHoneyTokensResponse(
@@ -32,7 +38,6 @@ def deploy_default_honey_tokens(db: Session) -> DeployHoneyTokensResponse:
             tokens=[HoneyTokenOut.model_validate(t) for t in active_tokens],
         )
 
-    # Deactivate existing stale tokens to avoid confusion
     db.query(HoneyToken).update({HoneyToken.status: "DECOMMISSIONED"})
 
     tokens_data = [
@@ -85,6 +90,78 @@ def deploy_default_honey_tokens(db: Session) -> DeployHoneyTokensResponse:
     )
 
 
+def plant_file_decoy(db: Session, target_path: Optional[str] = None) -> PlantDecoyResponse:
+    """Writes a real file-system decoy containing active honey-tokens and a live Canary URL."""
+    deploy_default_honey_tokens(db)
+    active_tokens = db.query(HoneyToken).filter(HoneyToken.status == "ACTIVE").all()
+    primary_id = active_tokens[0].id if active_tokens else 1
+
+    file_path_str = target_path or "./.zerospill_decoys/.env.production.decoy"
+    file_path = Path(file_path_str).resolve()
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    canary_url = f"http://127.0.0.1:8000/api/v1/honeytrap/canary/{primary_id}"
+
+    lines = [
+        "# ==============================================================================",
+        "# ZeroSpill Production Decoy Credential Vault (Tripwire Canary Protected)",
+        "# ANY ACCESS TO THESE VARIABLES OR CANARY URL WILL TRIGGER AGENT QUARANTINE",
+        "# ==============================================================================",
+    ]
+    for token in active_tokens:
+        lines.append(f"{token.decoy_key}={token.decoy_value}")
+    lines.append(f"ZEROSPILL_INTERNAL_API={canary_url}")
+    lines.append("")
+
+    file_path.write_text("\n".join(lines), encoding="utf-8")
+    now = datetime.now(timezone.utc)
+
+    return PlantDecoyResponse(
+        status="DECOY_FILE_PLANTED",
+        file_path=str(file_path),
+        canary_url=canary_url,
+        tokens_written=len(active_tokens),
+        timestamp=now,
+    )
+
+
+def trigger_canary_trip(db: Session, token_id: int) -> InspectCommandResponse:
+    """Handles an HTTP GET request to the Canary URL, logging a critical alert and tripping circuit breaker."""
+    now = datetime.now(timezone.utc)
+    token = db.query(HoneyToken).filter(HoneyToken.id == token_id).first()
+    token_label = f"{token.token_type} (#{token.id})" if token else f"Decoy #{token_id}"
+
+    alert = TrapAlert(
+        token_id=token_id if token else None,
+        command_snippet=f"HTTP GET /api/v1/honeytrap/canary/{token_id}",
+        trigger_type="CANARY_URL_TRIPPED",
+        severity="CRITICAL",
+        blocked=True,
+        incident_details=json.dumps({
+            "trigger": "CANARY_URL_TRIPPED",
+            "token_id": token_id,
+            "token_type": token.token_type if token else "UNKNOWN",
+            "explanation": "Live Canary Endpoint Triggered by Agent curl/fetch",
+        }),
+        timestamp=now,
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+
+    return InspectCommandResponse(
+        blocked=True,
+        severity="CRITICAL",
+        trigger_type="CANARY_URL_TRIPPED",
+        action_taken="CIRCUIT_BREAKER_TRIGGERED",
+        matched_tokens=[token_label],
+        matched_patterns=["LIVE_CANARY_PROBE"],
+        explanation=f"Live Canary Endpoint Triggered by Agent! Token {token_label} tripped.",
+        incident_id=alert.id,
+        timestamp=now,
+    )
+
+
 def inspect_agent_command(
     db: Session, command: str, context: Optional[str] = None
 ) -> InspectCommandResponse:
@@ -129,7 +206,6 @@ def inspect_agent_command(
             "command": command,
         }
 
-        # Log critical alert to SQLite
         alert = TrapAlert(
             token_id=matched_token_id,
             command_snippet=command[:1000],

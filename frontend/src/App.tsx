@@ -4,14 +4,17 @@ import { MetricBar } from './components/MetricBar';
 import { PixelShieldTab } from './components/PixelShieldTab';
 import { HoneyTrapTab } from './components/HoneyTrapTab';
 import { AirlockTab } from './components/AirlockTab';
+import { AgentHookTab } from './components/AgentHookTab';
 import { api, DashboardStats } from './services/api';
-import { Shield, Activity, Terminal, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Shield, Activity, AlertTriangle, CheckCircle2 } from 'lucide-react';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'pixel' | 'honey' | 'airlock'>('pixel');
+  const [activeTab, setActiveTab] = useState<'pixel' | 'honey' | 'airlock' | 'agent'>('pixel');
   const [isBackendOnline, setIsBackendOnline] = useState<boolean>(false);
+  const [isProductionMode, setIsProductionMode] = useState<boolean>(true); // Default to Production Mode
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loadingStats, setLoadingStats] = useState<boolean>(false);
+  const [isResetting, setIsResetting] = useState<boolean>(false);
 
   const fetchStats = useCallback(async () => {
     setLoadingStats(true);
@@ -25,6 +28,21 @@ export const App: React.FC = () => {
       setLoadingStats(false);
     }
   }, []);
+
+  const handleResetDb = async () => {
+    if (!window.confirm('Reset ZeroSpill database to a 100% clean slate? All logs and decoys will be cleared.')) {
+      return;
+    }
+    setIsResetting(true);
+    try {
+      await api.resetDatabase();
+      await fetchStats();
+    } catch (err) {
+      console.error('Failed to reset DB:', err);
+    } finally {
+      setIsResetting(false);
+    }
+  };
 
   useEffect(() => {
     fetchStats();
@@ -41,6 +59,10 @@ export const App: React.FC = () => {
         isBackendOnline={isBackendOnline}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        isProductionMode={isProductionMode}
+        setIsProductionMode={setIsProductionMode}
+        onResetDb={handleResetDb}
+        isResetting={isResetting}
       />
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 relative z-10">
@@ -53,13 +75,22 @@ export const App: React.FC = () => {
         {/* Tab Views */}
         <div className="mt-4">
           {activeTab === 'pixel' && (
-            <PixelShieldTab onScanCompleted={fetchStats} />
+            <PixelShieldTab
+              onScanCompleted={fetchStats}
+              isProductionMode={isProductionMode}
+            />
           )}
           {activeTab === 'honey' && (
-            <HoneyTrapTab onIncidentTriggered={fetchStats} />
+            <HoneyTrapTab
+              onIncidentTriggered={fetchStats}
+              isProductionMode={isProductionMode}
+            />
           )}
           {activeTab === 'airlock' && (
             <AirlockTab onScanCompleted={fetchStats} />
+          )}
+          {activeTab === 'agent' && (
+            <AgentHookTab />
           )}
         </div>
 
@@ -123,11 +154,14 @@ export const App: React.FC = () => {
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
           <div className="flex items-center space-x-2 text-slate-400">
             <Shield className="h-4 w-4 text-cyan-400" />
-            <span className="font-bold text-slate-300">ZeroSpill DLP Engine</span>
+            <span className="font-bold text-slate-300">ZeroSpill v2.0 Neural Engine</span>
             <span>&mdash; Open-Source AI Agent Security</span>
           </div>
-          <div>
-            <span>Pure Python backend &bull; Zero external binaries &bull; MIT Licensed</span>
+          <div className="flex items-center space-x-3">
+            <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400">
+              {isProductionMode ? 'Mode: Production Strict' : 'Mode: Sandbox Interactive'}
+            </span>
+            <span>MIT Licensed</span>
           </div>
         </div>
       </footer>

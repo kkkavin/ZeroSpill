@@ -10,20 +10,28 @@ import {
   CheckCircle,
   RefreshCw,
   Zap,
+  FileCode2,
+  Radio,
 } from 'lucide-react';
-import { api, HoneyToken, InspectCommandResponse } from '../services/api';
+import { api, HoneyToken, InspectCommandResponse, PlantDecoyResponse } from '../services/api';
 
 interface HoneyTrapTabProps {
   onIncidentTriggered: () => void;
+  isProductionMode: boolean;
 }
 
-export const HoneyTrapTab: React.FC<HoneyTrapTabProps> = ({ onIncidentTriggered }) => {
+export const HoneyTrapTab: React.FC<HoneyTrapTabProps> = ({
+  onIncidentTriggered,
+  isProductionMode,
+}) => {
   const [tokens, setTokens] = useState<HoneyToken[]>([]);
   const [loadingTokens, setLoadingTokens] = useState<boolean>(false);
   const [commandInput, setCommandInput] = useState<string>('cat .env.production');
   const [inspecting, setInspecting] = useState<boolean>(false);
   const [result, setResult] = useState<InspectCommandResponse | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
+  const [plantedDecoy, setPlantedDecoy] = useState<PlantDecoyResponse | null>(null);
+  const [planting, setPlanting] = useState<boolean>(false);
 
   const fetchTokens = async () => {
     setLoadingTokens(true);
@@ -46,6 +54,34 @@ export const HoneyTrapTab: React.FC<HoneyTrapTabProps> = ({ onIncidentTriggered 
       console.error(err);
     } finally {
       setLoadingTokens(false);
+    }
+  };
+
+  const handlePlantFile = async () => {
+    setPlanting(true);
+    try {
+      const res = await api.plantDecoyFile();
+      setPlantedDecoy(res);
+      await fetchTokens();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setPlanting(false);
+    }
+  };
+
+  const handleTestCanary = async () => {
+    setInspecting(true);
+    setResult(null);
+    try {
+      const tokenId = tokens[0]?.id || 1;
+      const res = await api.triggerCanary(tokenId);
+      setResult(res);
+      onIncidentTriggered();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setInspecting(false);
     }
   };
 
@@ -126,27 +162,58 @@ export const HoneyTrapTab: React.FC<HoneyTrapTabProps> = ({ onIncidentTriggered 
                 MODULE B
               </span>
               <h3 className="text-lg font-bold text-white tracking-tight">
-                Anti-Scavenging Honey-Token Trap & Circuit-Breaker
+                Anti-Scavenging Honey-Token Trap & Live Canary Tripwire
               </h3>
             </div>
             <p className="text-sm text-slate-400 mt-1 max-w-3xl">
-              Defends against rogue AI agent tool calls by deploying tripwire credentials.
-              If an autonomous coding agent scrapes decoy files or attempts destructive commands,
+              Deploys tripwire decoy credentials and plants real canary files on disk.
+              If an autonomous agent accesses these decoys or attempts destructive shell actions,
               the circuit breaker engages instantly to terminate the agent session.
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center flex-wrap gap-2.5">
+            <button
+              onClick={handlePlantFile}
+              disabled={planting}
+              className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-medium text-xs flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20 transition-all disabled:opacity-50 active:scale-95"
+            >
+              <FileCode2 className="h-3.5 w-3.5" />
+              <span>{planting ? 'Writing file...' : 'Plant Decoy File on Disk'}</span>
+            </button>
+
             <button
               onClick={handleDeployTokens}
               disabled={loadingTokens}
-              className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white font-medium text-sm flex items-center space-x-2 shadow-lg shadow-rose-500/20 transition-all disabled:opacity-50 active:scale-95"
+              className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white font-medium text-xs flex items-center space-x-1.5 shadow-lg shadow-rose-500/20 transition-all disabled:opacity-50 active:scale-95"
             >
-              <Key className="h-4 w-4" />
-              <span>{loadingTokens ? 'Deploying...' : 'Deploy Decoy Credentials'}</span>
+              <Key className="h-3.5 w-3.5" />
+              <span>{loadingTokens ? 'Deploying...' : 'Deploy Decoy Tokens'}</span>
+            </button>
+
+            <button
+              onClick={handleTestCanary}
+              disabled={inspecting}
+              className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 font-mono font-medium text-xs flex items-center space-x-1.5 border border-amber-500/30 transition-all active:scale-95"
+            >
+              <Radio className="h-3.5 w-3.5 animate-pulse" />
+              <span>Test Canary Tripwire</span>
             </button>
           </div>
         </div>
+
+        {/* Planted Decoy Alert */}
+        {plantedDecoy && (
+          <div className="mt-4 p-3.5 rounded-xl bg-cyan-950/40 border border-cyan-500/30 font-mono text-xs text-cyan-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <span className="font-bold text-white">DECOY FILE ACTIVE: </span>
+              <span className="text-cyan-300">{plantedDecoy.file_path}</span>
+            </div>
+            <div className="text-[11px] text-slate-400">
+              Canary: <span className="text-amber-400 font-semibold">{plantedDecoy.canary_url}</span>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Circuit Breaker Alert Banner */}
@@ -230,22 +297,24 @@ export const HoneyTrapTab: React.FC<HoneyTrapTabProps> = ({ onIncidentTriggered 
           </span>
         </div>
 
-        {/* Preset Buttons */}
-        <div className="flex flex-wrap gap-2 mb-4">
-          {attackPresets.map((preset, idx) => (
-            <button
-              key={idx}
-              onClick={() => {
-                setCommandInput(preset.cmd);
-                handleInspect(preset.cmd);
-              }}
-              className="px-3 py-1.5 rounded-lg text-xs font-mono font-medium bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-all flex items-center space-x-1.5 active:scale-95"
-            >
-              <Zap className="h-3 w-3 text-amber-400" />
-              <span>{preset.label}</span>
-            </button>
-          ))}
-        </div>
+        {/* Preset Buttons (Shown in Sandbox Mode or as collapsed) */}
+        {!isProductionMode && (
+          <div className="flex flex-wrap gap-2 mb-4">
+            {attackPresets.map((preset, idx) => (
+              <button
+                key={idx}
+                onClick={() => {
+                  setCommandInput(preset.cmd);
+                  handleInspect(preset.cmd);
+                }}
+                className="px-3 py-1.5 rounded-lg text-xs font-mono font-medium bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-all flex items-center space-x-1.5 active:scale-95"
+              >
+                <Zap className="h-3 w-3 text-amber-400" />
+                <span>{preset.label}</span>
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Input Bar */}
         <div className="flex flex-col sm:flex-row gap-3">
@@ -343,7 +412,7 @@ export const HoneyTrapTab: React.FC<HoneyTrapTabProps> = ({ onIncidentTriggered 
               ) : (
                 <tr>
                   <td colSpan={5} className="py-8 text-center text-slate-500">
-                    No active honey tokens found. Click &ldquo;Deploy Decoy Credentials&rdquo; to seed the database.
+                    No active honey tokens found. Click &ldquo;Deploy Decoy Tokens&rdquo; to seed the database.
                   </td>
                 </tr>
               )}

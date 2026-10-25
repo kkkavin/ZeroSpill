@@ -12,6 +12,12 @@ class BoundingBox(BaseModel):
     y2: int
     severity: str = "CRITICAL"
     confidence: float = 0.99
+    masked_text: Optional[str] = None
+
+
+class OCRLine(BaseModel):
+    text: str
+    confidence: float
 
 
 class GenerateSampleResponse(BaseModel):
@@ -21,6 +27,8 @@ class GenerateSampleResponse(BaseModel):
     secrets_detected: int
     width: int
     height: int
+    is_safe: bool = False
+    ocr_lines: List[OCRLine] = []
 
 
 class RedactRequest(BaseModel):
@@ -35,6 +43,7 @@ class RedactionTelemetry(BaseModel):
     pixels_blurred: int
     secrets_redacted: int
     redaction_mode: str
+    ocr_lines_processed: int = 0
 
 
 class RedactResponse(BaseModel):
@@ -42,6 +51,8 @@ class RedactResponse(BaseModel):
     redacted_image_base64: str
     bounding_boxes: List[BoundingBox]
     secrets_detected: int
+    is_safe: bool = True
+    ocr_lines: List[OCRLine] = []
     telemetry: RedactionTelemetry
 
 
@@ -62,6 +73,18 @@ class DeployHoneyTokensResponse(BaseModel):
     status: str
     deployed_count: int
     tokens: List[HoneyTokenOut]
+
+
+class PlantDecoyRequest(BaseModel):
+    target_path: Optional[str] = None
+
+
+class PlantDecoyResponse(BaseModel):
+    status: str
+    file_path: str
+    canary_url: str
+    tokens_written: int
+    timestamp: datetime
 
 
 class InspectCommandRequest(BaseModel):
@@ -104,6 +127,28 @@ class AirlockScanResponse(BaseModel):
     timestamp: datetime
 
 
+# Agent Hook & Integration Schemas
+class AgentHookInstallResponse(BaseModel):
+    status: str
+    hook_path: str
+    rule_path: str
+    message: str
+
+
+class AgentHookStatusResponse(BaseModel):
+    hook_installed: bool
+    rule_installed: bool
+    hook_path: str
+    rule_path: str
+
+
+# Admin Schemas
+class ResetDbResponse(BaseModel):
+    status: str
+    message: str
+    rows_deleted: Dict[str, int]
+
+
 # Dashboard Telemetry Schemas
 class DashboardStats(BaseModel):
     total_screenshots_redacted: int
@@ -111,4 +156,3 @@ class DashboardStats(BaseModel):
     blocked_scavenge_attempts: int
     airlock_audits: int
     recent_events: List[Dict[str, Any]]
-

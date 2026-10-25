@@ -1,13 +1,30 @@
 import base64
+from collections import Counter
+from datetime import datetime, timezone
 import io
 import json
+import math
+import re
 import time
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from rapidocr_onnxruntime import RapidOCR
 from sqlalchemy.orm import Session
 
 from ..models import ImageScanLog
-from ..schemas import BoundingBox, GenerateSampleResponse, RedactResponse, RedactionTelemetry
+from ..schemas import BoundingBox, GenerateSampleResponse, OCRLine, RedactResponse, RedactionTelemetry
+
+# Lazy-loaded singleton OCR instance
+_OCR_ENGINE: Optional[RapidOCR] = None
+
+
+def get_ocr_engine() -> RapidOCR:
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
 
 
 def image_to_base64(img: Image.Image, format: str = "PNG") -> str:
@@ -24,138 +41,136 @@ def base64_to_image(b64_string: str) -> Image.Image:
     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
 
-def create_sample_developer_screenshot() -> Tuple[Image.Image, List[BoundingBox]]:
-    """Generates an 800x480 dark-mode developer screenshot containing sensitive agent secrets."""
-    width, height = 800, 480
-    img = Image.new("RGB", (width, height), color=(15, 23, 42))  # Slate-900
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
+def shannon_entropy(text: str) -> float:
+    """Calculates the Shannon entropy of a string in bits per symbol."""
+    if not text:
+        return 0.0
+    length = len(text)
+    counts = Counter(text)
+    entropy = 0.0
+    for count in counts.values():
+        p = count / length
+        entropy -= p * math.log2(p)
+    return round(entropy, 3)
 
-    # Window Title Bar (macOS / Linux terminal style)
-    draw.rectangle([(0, 0), (width, 34)], fill=(30, 41, 59))  # Slate-800
-    draw.line([(0, 34), (width, 34)], fill=(51, 65, 85), width=1)
 
-    # Traffic Light Buttons
-    draw.ellipse([(14, 11), (26, 23)], fill=(239, 68, 68))  # Red
-    draw.ellipse([(34, 11), (46, 23)], fill=(245, 158, 11))  # Amber
-    draw.ellipse([(54, 11), (66, 23)], fill=(34, 197, 94))  # Green
+# Strict Regex Rules for Secrets & Sensitive PII
+SECRET_PATTERNS = [
+    # a) Secret assignments & specific prefixes
+    (r"(?i)\b(?:OPENAI_API_KEY|API_KEY|SECRET_KEY|SECRET|TOKEN|PASSWORD|PASSWD|AUTH_TOKEN)\b\s*[:=]\s*['\"]?([^\s'\"]{6,})", "CREDENTIAL_ASSIGNMENT", "CRITICAL"),
+    (r"\bsk-proj-[a-zA-Z0-9_\-]{16,}\b", "OPENAI_PROJECT_KEY", "CRITICAL"),
+    (r"\bsk-[a-zA-Z0-9]{20,}\b", "OPENAI_LEGACY_KEY", "CRITICAL"),
+    (r"\bAKIA[0-9A-Z]{16}\b", "AWS_ACCESS_KEY_ID", "CRITICAL"),
+    (r"\bghp_[a-zA-Z0-9]{30,}\b", "GITHUB_PAT", "CRITICAL"),
+    (r"\bgho_[a-zA-Z0-9]{30,}\b", "GITHUB_OAUTH_TOKEN", "CRITICAL"),
+    (r"\brwy_trap_[a-zA-Z0-9]{8,}\b", "RAILWAY_TRAP_TOKEN", "CRITICAL"),
+    (r"\brwy_[a-zA-Z0-9]{16,}\b", "RAILWAY_PROD_TOKEN", "CRITICAL"),
+    (r"\brzp_live_[a-zA-Z0-9]{10,}\b", "RAZORPAY_LIVE_SECRET", "CRITICAL"),
+    (r"\brzp_test_[a-zA-Z0-9]{10,}\b", "RAZORPAY_TEST_SECRET", "HIGH"),
 
-    # Window Title
-    title = "zerospill-agent-session-0914 — bash (tmux: 2 panes) — 800x480"
-    draw.text((80, 11), title, fill=(203, 213, 225), font=font)
+    # b) Connection URIs with credentials
+    (r"(?i)\b(?:postgresql|postgres|mongodb(?:\+srv)?|mysql|redis):\/\/[a-zA-Z0-9_\-\.]+:[^@\s]+@[^\s]+\b", "DATABASE_URI_WITH_CREDS", "CRITICAL"),
+    (r"(?i)\bDATABASE_URL\s*[:=]\s*[^\s]+", "DATABASE_URL_CONFIG", "CRITICAL"),
 
-    # Pane Split: Left Terminal (0..480), Right DevTools (480..800)
-    split_x = 480
-    draw.line([(split_x, 34), (split_x, height)], fill=(51, 65, 85), width=2)
-    draw.rectangle([(split_x, 34), (width, height)], fill=(11, 15, 25))
+    # c) PII patterns
+    (r"\b[a-zA-Z0-9.\-_]{2,}@(okaxis|okhdfcbank|okicici|oksbi|paytm|ybl|upi|apl)\b", "UPI_PAYMENT_VPA", "HIGH"),
+    (r"\bUPI_ID\s*[:=]\s*[a-zA-Z0-9.\-_@]+\b", "UPI_PAYMENT_VPA", "HIGH"),
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "PII_EMAIL_ADDRESS", "HIGH"),
+    (r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "PII_PHONE_NUMBER", "HIGH"),
+    (r"\b(?:\d{4}[-\s]){3}\d{4}\b", "PII_CREDIT_CARD_BLOCK", "CRITICAL"),
+    (r"\b\d{4}\s\d{4}\s\d{4}\b", "PII_AADHAAR_BLOCK", "HIGH"),
+]
 
-    # Right Pane Header
-    draw.rectangle([(split_x, 34), (width, 64)], fill=(19, 27, 44))
-    draw.text((split_x + 16, 42), "AGENT REST DEVTOOLS (HTTP 200)", fill=(56, 189, 248), font=font)
 
-    # Left Pane Terminal Content
-    term_x = 20
-    draw.text((term_x, 50), "agent@sandbox:~$ whoami", fill=(148, 163, 184), font=font)
-    draw.text((term_x, 68), "autonomous-developer-agent-v2.4", fill=(74, 222, 128), font=font)
+def mask_secret(text: str) -> str:
+    """Produces a safe masked representation of recognized secret text."""
+    if len(text) <= 8:
+        return text[:2] + "***"
+    return text[:6] + "..." + text[-4:] + " [MASKED]"
 
-    draw.text((term_x, 95), "agent@sandbox:~$ cat .env.production", fill=(148, 163, 184), font=font)
-    draw.text((term_x, 112), "# CRITICAL SECRETS - INGESTED BY RUNTIME", fill=(100, 116, 139), font=font)
 
-    # Secret 1: OPENAI_API_KEY
-    # Line y is ~135. Let's place the key and record bounding box.
-    secret1_text = "OPENAI_API_KEY=sk-proj-99887766secret-prod-access"
-    draw.text((term_x, 135), secret1_text, fill=(244, 63, 94), font=font)
-    box1 = BoundingBox(
-        label="OPENAI_API_KEY",
-        x1=term_x + 95,
-        y1=130,
-        x2=term_x + 380,
-        y2=152,
-        severity="CRITICAL",
-        confidence=0.99,
-    )
+def classify_ocr_text(text: str) -> Optional[Tuple[str, str, str]]:
+    """Evaluates recognized text against strict secret and PII rules.
 
-    # Secret 2: DATABASE_URL
-    secret2_text = "DATABASE_URL=postgresql://admin:prodpass99@db.internal:5432/primary"
-    draw.text((term_x, 165), secret2_text, fill=(251, 146, 60), font=font)
-    box2 = BoundingBox(
-        label="DATABASE_URL",
-        x1=term_x + 85,
-        y1=160,
-        x2=term_x + 440,
-        y2=182,
-        severity="CRITICAL",
-        confidence=0.98,
-    )
+    Returns (label, severity, masked_text) if a secret is found, else None.
+    NEVER flags normal English prose, UI labels, or standard safe code.
+    """
+    clean_text = text.strip()
+    if not clean_text or len(clean_text) < 4:
+        return None
 
-    # Secret 3: UPI_ID
-    secret3_text = "UPI_ID=merchant@okaxis"
-    draw.text((term_x, 195), secret3_text, fill=(250, 204, 21), font=font)
-    box3 = BoundingBox(
-        label="UPI_PAYMENT_VPA",
-        x1=term_x + 45,
-        y1=190,
-        x2=term_x + 200,
-        y2=212,
-        severity="HIGH",
-        confidence=0.95,
-    )
+    # Ignore common benign code/terminal prompts that might look like keywords
+    lower = clean_text.lower()
+    if lower in ("git status", "npm run test", "pytest", "ls -la", "cd ..", "python main.py"):
+        return None
 
-    draw.text((term_x, 230), "agent@sandbox:~$ curl -s -X POST https://api.openai.com/v1/chat \\", fill=(148, 163, 184), font=font)
-    draw.text((term_x + 20, 248), "-H 'Authorization: Bearer sk-proj-99887766secret' ...", fill=(244, 63, 94), font=font)
-    box4 = BoundingBox(
-        label="OPENAI_BEARER_TOKEN",
-        x1=term_x + 175,
-        y1=244,
-        x2=term_x + 430,
-        y2=264,
-        severity="CRITICAL",
-        confidence=0.97,
-    )
+    # Check against known secret / PII patterns
+    for pattern, rule_label, severity in SECRET_PATTERNS:
+        match = re.search(pattern, clean_text)
+        if match:
+            matched_str = match.group(0)
+            return (rule_label, severity, mask_secret(matched_str))
 
-    draw.text((term_x, 280), "agent@sandbox:~$ echo '[OK] Secrets piped to stdout for tool call'", fill=(74, 222, 128), font=font)
-    draw.text((term_x, 310), "agent@sandbox:~$ git status", fill=(148, 163, 184), font=font)
-    draw.text((term_x, 328), "On branch main. Changes not staged for commit: .env.production", fill=(234, 179, 8), font=font)
+    # d) Check for high-entropy secret tokens:
+    # Must be a continuous token (len >= 16, no spaces), high Shannon entropy (>= 4.30 bits),
+    # and contain mixed character classes (lowercase + uppercase + digits/symbols)
+    words = clean_text.split()
+    for w in words:
+        # Strip common punctuation quotes
+        w_clean = w.strip("'\",;()[]{}")
+        if len(w_clean) >= 16 and not w_clean.startswith("http") and not "/" in w_clean:
+            has_upper = any(c.isupper() for c in w_clean)
+            has_lower = any(c.islower() for c in w_clean)
+            has_digit = any(c.isdigit() for c in w_clean)
+            classes = sum([has_upper, has_lower, has_digit])
+            if classes >= 2:
+                entropy = shannon_entropy(w_clean)
+                if entropy >= 4.30:
+                    return ("HIGH_SHANNON_ENTROPY_SECRET", "HIGH", mask_secret(w_clean))
 
-    # Bottom status in Left Pane
-    draw.rectangle([(10, 430), (470, 465)], fill=(30, 41, 59))
-    draw.text((20, 442), "ACTIVE AGENT TRACE [PID 9410] :: VULNERABLE TO SCREEN-SCRAPING", fill=(248, 113, 113), font=font)
+    return None
 
-    # Right Pane DevTools Content
-    dt_x = split_x + 16
-    draw.text((dt_x, 75), "REQUEST HEADERS:", fill=(148, 163, 184), font=font)
-    draw.text((dt_x, 92), "Host: api.zerospill.local", fill=(100, 116, 139), font=font)
-    draw.text((dt_x, 108), "User-Agent: AgentDLP/3.0 (headless)", fill=(100, 116, 139), font=font)
-    draw.text((dt_x, 124), "X-Internal-Token: rwy_trap_9901f417b189c4d2", fill=(244, 63, 94), font=font)
-    box5 = BoundingBox(
-        label="RAILWAY_AUTH_TOKEN",
-        x1=dt_x + 105,
-        y1=120,
-        x2=dt_x + 300,
-        y2=140,
-        severity="CRITICAL",
-        confidence=0.96,
-    )
 
-    draw.text((dt_x, 155), "RESPONSE JSON BODY:", fill=(148, 163, 184), font=font)
-    draw.text((dt_x, 175), '{\n  "service": "billing-engine",\n  "status": "authorized",', fill=(203, 213, 225), font=font)
-    draw.text((dt_x, 215), '  "settlement_vpa": "merchant@okaxis",', fill=(250, 204, 21), font=font)
-    box6 = BoundingBox(
-        label="UPI_PAYMENT_VPA",
-        x1=dt_x + 125,
-        y1=212,
-        x2=dt_x + 285,
-        y2=232,
-        severity="HIGH",
-        confidence=0.94,
-    )
-    draw.text((dt_x, 245), '  "internal_cluster": "k8s-prod-in-01"\n}', fill=(203, 213, 225), font=font)
+def run_neural_ocr_scan(img: Image.Image) -> Tuple[List[BoundingBox], List[OCRLine]]:
+    """Runs RapidOCR on the image and returns genuine secret bounding boxes and all OCR text lines."""
+    ocr = get_ocr_engine()
+    np_img = np.array(img)
 
-    # Terminal cursor blink effect
-    draw.rectangle([(term_x, 350), (term_x + 8, 364)], fill=(56, 189, 248))
+    result, _ = ocr(np_img)
+    if not result:
+        return [], []
 
-    boxes = [box1, box2, box3, box4, box5, box6]
-    return img, boxes
+    boxes: List[BoundingBox] = []
+    ocr_lines: List[OCRLine] = []
+
+    for item in result:
+        # RapidOCR format: [polygon_box, text, confidence]
+        poly, text, score = item[0], str(item[1]), float(item[2])
+        ocr_lines.append(OCRLine(text=text, confidence=round(score, 3)))
+
+        classification = classify_ocr_text(text)
+        if classification:
+            label, severity, masked = classification
+            # Convert 4-point polygon to [x1, y1, x2, y2]
+            xs = [pt[0] for pt in poly]
+            ys = [pt[1] for pt in poly]
+            min_x = max(0, int(min(xs)) - 3)
+            min_y = max(0, int(min(ys)) - 3)
+            max_x = min(img.width, int(max(xs)) + 3)
+            max_y = min(img.height, int(max(ys)) + 3)
+
+            boxes.append(BoundingBox(
+                label=label,
+                x1=min_x,
+                y1=min_y,
+                x2=max_x,
+                y2=max_y,
+                severity=severity,
+                confidence=round(score, 3),
+                masked_text=masked,
+            ))
+
+    return boxes, ocr_lines
 
 
 def apply_pixel_redaction(
@@ -163,20 +178,21 @@ def apply_pixel_redaction(
     boxes: List[BoundingBox],
     blur_radius: int = 14
 ) -> Tuple[Image.Image, int]:
-    """Applies GaussianBlur and warning bounding borders to sensitive regions."""
+    """Applies GaussianBlur(radius=14) and warning bounding borders strictly over sensitive regions."""
+    if not boxes:
+        return img.copy(), 0
+
     redacted = img.copy()
     draw = ImageDraw.Draw(redacted)
     pixels_blurred = 0
     font = ImageFont.load_default()
 
     for box in boxes:
-        # Clamp coordinates to image bounds
         x1 = max(0, min(box.x1, img.width - 1))
         y1 = max(0, min(box.y1, img.height - 1))
         x2 = max(x1 + 1, min(box.x2, img.width))
         y2 = max(y1 + 1, min(box.y2, img.height))
 
-        # Crop region and blur heavily
         crop_box = (x1, y1, x2, y2)
         region = img.crop(crop_box)
         blurred_region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -184,12 +200,10 @@ def apply_pixel_redaction(
 
         pixels_blurred += (x2 - x1) * (y2 - y1)
 
-        # Draw crisp high-visibility warning border and label badge
         border_color = (239, 68, 68) if box.severity == "CRITICAL" else (245, 158, 11)
         draw.rectangle([(x1 - 1, y1 - 1), (x2 + 1, y2 + 1)], outline=border_color, width=2)
 
-        # Redaction badge
-        badge_text = f"🛡️ REDACTED: {box.label}"
+        badge_text = f"REDACTED: {box.label}"
         badge_w = len(badge_text) * 6 + 8
         badge_h = 14
         badge_y = max(0, y1 - badge_h)
@@ -199,59 +213,60 @@ def apply_pixel_redaction(
     return redacted, pixels_blurred
 
 
-def auto_detect_sensitive_regions(img: Image.Image) -> List[BoundingBox]:
-    """Heuristic detector: Scans image for high-contrast secret-like horizontal text strips.
+def create_sample_developer_screenshot() -> Image.Image:
+    """Generates an 800x480 dark-mode developer screenshot with high-contrast text for OCR."""
+    width, height = 800, 480
+    img = Image.new("RGB", (width, height), color=(15, 23, 42))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
 
-    Works 100% in pure Python with Pillow without external binaries.
-    """
-    boxes: List[BoundingBox] = []
-    width, height = img.size
+    # Title bar
+    draw.rectangle([(0, 0), (width, 34)], fill=(30, 41, 59))
+    draw.ellipse([(14, 11), (26, 23)], fill=(239, 68, 68))
+    draw.ellipse([(34, 11), (46, 23)], fill=(245, 158, 11))
+    draw.ellipse([(54, 11), (66, 23)], fill=(34, 197, 94))
+    draw.text((80, 11), "agent-session-0914 — bash (tmux: 2 panes) — 800x480", fill=(203, 213, 225), font=font)
 
-    # If the image matches the standard sample dimension (800x480), identify canonical target regions
-    if width == 800 and height == 480:
-        _, sample_boxes = create_sample_developer_screenshot()
-        return sample_boxes
+    # Split panes
+    split_x = 440
+    draw.line([(split_x, 34), (split_x, height)], fill=(51, 65, 85), width=2)
+    draw.rectangle([(split_x, 34), (width, height)], fill=(11, 15, 25))
 
-    # Generic heuristic: scan horizontal bands with high edge variance
-    # Divide into horizontal strips of 24px and check contrast
-    gray = img.convert("L")
-    strip_height = 24
-    for y in range(36, height - strip_height, strip_height):
-        strip = gray.crop((20, y, min(width - 20, 600), y + strip_height))
-        extrema = strip.getextrema()
-        if extrema and (extrema[1] - extrema[0]) > 140:
-            # High contrast region found
-            boxes.append(BoundingBox(
-                label="DETECTED_HIGH_CONTRAST_SECRET",
-                x1=20,
-                y1=y,
-                x2=min(width - 20, 480),
-                y2=y + strip_height,
-                severity="HIGH",
-                confidence=0.88,
-            ))
-            if len(boxes) >= 5:
-                break
+    # Left pane text
+    tx = 20
+    draw.text((tx, 50), "agent@sandbox:~$ cat .env.production", fill=(148, 163, 184), font=font)
+    draw.text((tx, 75), "# PRODUCTION SECRETS", fill=(100, 116, 139), font=font)
+    draw.text((tx, 105), "OPENAI_API_KEY=sk-proj-99887766secretKey12345", fill=(244, 63, 94), font=font)
+    draw.text((tx, 140), "DATABASE_URL=postgresql://admin:prodpass99@db.internal:5432/main", fill=(251, 146, 60), font=font)
+    draw.text((tx, 175), "UPI_ID=merchant@okaxis", fill=(250, 204, 21), font=font)
+    draw.text((tx, 210), "AWS_ACCESS_KEY_ID=AKIA9988776655443322", fill=(244, 63, 94), font=font)
+    draw.text((tx, 250), "agent@sandbox:~$ git commit -m 'feat: add runtime'", fill=(148, 163, 184), font=font)
 
-    return boxes
+    # Right pane devtools
+    dx = split_x + 16
+    draw.text((dx, 50), "REST API DEVTOOLS [POST /v1/auth]", fill=(56, 189, 248), font=font)
+    draw.text((dx, 85), "X-Railway-Token: rwy_trap_9901f417b189c4d2", fill=(244, 63, 94), font=font)
+    draw.text((dx, 120), "Settlement: merchant@okaxis", fill=(250, 204, 21), font=font)
+    draw.text((dx, 155), "Razorpay: rzp_live_99887766aabbcc", fill=(244, 63, 94), font=font)
+
+    return img
 
 
 def generate_sample_service(db: Session) -> GenerateSampleResponse:
-    start_time = time.time()
-    raw_img, boxes = create_sample_developer_screenshot()
+    raw_img = create_sample_developer_screenshot()
+    boxes, ocr_lines = run_neural_ocr_scan(raw_img)
     redacted_img, _ = apply_pixel_redaction(raw_img, boxes, blur_radius=14)
 
     raw_b64 = image_to_base64(raw_img)
     redacted_b64 = image_to_base64(redacted_img)
 
-    # Log to SQLite
     log = ImageScanLog(
         filename="simulated_agent_session_800x480.png",
         width=raw_img.width,
         height=raw_img.height,
         secrets_detected=len(boxes),
         bounding_boxes_json=json.dumps([b.model_dump() for b in boxes]),
-        redaction_mode="GAUSSIAN_BLUR_14",
+        redaction_mode="NEURAL_RAPIDOCR_GAUSSIAN_BLUR_14",
     )
     db.add(log)
     db.commit()
@@ -263,6 +278,8 @@ def generate_sample_service(db: Session) -> GenerateSampleResponse:
         secrets_detected=len(boxes),
         width=raw_img.width,
         height=raw_img.height,
+        is_safe=len(boxes) == 0,
+        ocr_lines=ocr_lines,
     )
 
 
@@ -276,10 +293,14 @@ def redact_image_service(
     start_time = time.time()
 
     boxes: List[BoundingBox] = []
+    ocr_lines: List[OCRLine] = []
+
     if custom_boxes and len(custom_boxes) > 0:
         boxes.extend(custom_boxes)
     elif auto_detect:
-        boxes = auto_detect_sensitive_regions(img)
+        # Run real Neural OCR
+        detected_boxes, ocr_lines = run_neural_ocr_scan(img)
+        boxes.extend(detected_boxes)
 
     redacted_img, pixels_blurred = apply_pixel_redaction(img, boxes, blur_radius=14)
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
@@ -287,14 +308,13 @@ def redact_image_service(
     raw_b64 = image_to_base64(img)
     redacted_b64 = image_to_base64(redacted_img)
 
-    # Record in SQLite
     log = ImageScanLog(
         filename=filename,
         width=img.width,
         height=img.height,
         secrets_detected=len(boxes),
         bounding_boxes_json=json.dumps([b.model_dump() for b in boxes]),
-        redaction_mode="GAUSSIAN_BLUR_14",
+        redaction_mode="NEURAL_RAPIDOCR_GAUSSIAN_BLUR_14",
     )
     db.add(log)
     db.commit()
@@ -304,10 +324,13 @@ def redact_image_service(
         redacted_image_base64=redacted_b64,
         bounding_boxes=boxes,
         secrets_detected=len(boxes),
+        is_safe=len(boxes) == 0,
+        ocr_lines=ocr_lines,
         telemetry=RedactionTelemetry(
             execution_time_ms=elapsed_ms,
             pixels_blurred=pixels_blurred,
             secrets_redacted=len(boxes),
-            redaction_mode="GAUSSIAN_BLUR_14",
+            redaction_mode="NEURAL_RAPIDOCR_GAUSSIAN_BLUR_14",
+            ocr_lines_processed=len(ocr_lines),
         ),
     )

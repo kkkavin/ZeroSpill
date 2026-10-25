@@ -8,6 +8,12 @@ export interface BoundingBox {
   y2: number;
   severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
   confidence: number;
+  masked_text?: string;
+}
+
+export interface OCRLine {
+  text: string;
+  confidence: number;
 }
 
 export interface GenerateSampleResponse {
@@ -17,6 +23,8 @@ export interface GenerateSampleResponse {
   secrets_detected: number;
   width: number;
   height: number;
+  is_safe: boolean;
+  ocr_lines: OCRLine[];
 }
 
 export interface RedactResponse {
@@ -24,11 +32,14 @@ export interface RedactResponse {
   redacted_image_base64: string;
   bounding_boxes: BoundingBox[];
   secrets_detected: number;
+  is_safe: boolean;
+  ocr_lines: OCRLine[];
   telemetry: {
     execution_time_ms: number;
     pixels_blurred: number;
     secrets_redacted: number;
     redaction_mode: string;
+    ocr_lines_processed?: number;
   };
 }
 
@@ -46,6 +57,14 @@ export interface DeployHoneyTokensResponse {
   status: string;
   deployed_count: number;
   tokens: HoneyToken[];
+}
+
+export interface PlantDecoyResponse {
+  status: string;
+  file_path: string;
+  canary_url: string;
+  tokens_written: number;
+  timestamp: string;
 }
 
 export interface InspectCommandResponse {
@@ -75,6 +94,26 @@ export interface AirlockScanResponse {
   sanitized_content: string;
   audit_id: number;
   timestamp: string;
+}
+
+export interface AgentHookStatusResponse {
+  hook_installed: boolean;
+  rule_installed: boolean;
+  hook_path: string;
+  rule_path: string;
+}
+
+export interface AgentHookInstallResponse {
+  status: string;
+  hook_path: string;
+  rule_path: string;
+  message: string;
+}
+
+export interface ResetDbResponse {
+  status: string;
+  message: string;
+  rows_deleted: Record<string, number>;
 }
 
 export interface DashboardStats {
@@ -142,6 +181,22 @@ export const api = {
     return res.json();
   },
 
+  async plantDecoyFile(targetPath?: string): Promise<PlantDecoyResponse> {
+    const res = await fetch(`${API_BASE}/v1/honeytrap/plant-file`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_path: targetPath }),
+    });
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    return res.json();
+  },
+
+  async triggerCanary(tokenId = 1): Promise<InspectCommandResponse> {
+    const res = await fetch(`${API_BASE}/v1/honeytrap/canary/${tokenId}`);
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    return res.json();
+  },
+
   async inspectCommand(command: string, context?: string): Promise<InspectCommandResponse> {
     const res = await fetch(`${API_BASE}/v1/honeytrap/inspect-command`, {
       method: 'POST',
@@ -157,6 +212,28 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, source_type: sourceType }),
+    });
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    return res.json();
+  },
+
+  async installAgentHook(): Promise<AgentHookInstallResponse> {
+    const res = await fetch(`${API_BASE}/v1/agent-integration/install-hook`, {
+      method: 'POST',
+    });
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    return res.json();
+  },
+
+  async getAgentHookStatus(): Promise<AgentHookStatusResponse> {
+    const res = await fetch(`${API_BASE}/v1/agent-integration/status`);
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    return res.json();
+  },
+
+  async resetDatabase(): Promise<ResetDbResponse> {
+    const res = await fetch(`${API_BASE}/v1/admin/reset-db`, {
+      method: 'POST',
     });
     if (!res.ok) throw new Error(`HTTP error ${res.status}`);
     return res.json();

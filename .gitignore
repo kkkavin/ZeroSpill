@@ -53,6 +53,7 @@ pnpm-debug.log*
 .env.vault
 *.pem
 *.key
+.zerospill_decoys/
 
 # IDEs & OS
 .vscode/
